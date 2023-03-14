@@ -3,7 +3,6 @@
 pragma solidity 0.8.14;
 
 import {IBaseLibrary} from "../../interfaces/IBaseLibrary.sol";
-import {IBaseStrategy} from "../../interfaces/IBaseStrategy.sol";
 
 // Interface to use during testing that implements the 4626 standard the Library functions and the Strategies immutable functions
 interface IMockStrategy is IBaseLibrary {

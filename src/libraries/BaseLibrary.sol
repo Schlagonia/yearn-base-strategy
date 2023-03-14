@@ -5,6 +5,7 @@ pragma solidity 0.8.14;
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 import {DiamondHelper, IDiamond, IDiamondLoupe} from "../DiamondHelper.sol";
 
@@ -26,6 +27,8 @@ import "forge-std/console.sol";
 //      add cloning
 //      Add support interface for IERC165 https://github.com/mudgen/diamond-2-hardhat/blob/main/contracts/interfaces/IERC165.sol
 //      Should storage stuct and variable be in its own contract. So it can be imported without accidently linking the library
+//      Add reentrancy gaurds?
+//      unsafe math library for easy unchecked
 
 library BaseLibrary {
     using SafeERC20 for ERC20;
@@ -166,6 +169,7 @@ library BaseLibrary {
         uint256 lastReport; // The last time a {report} was called.
         uint16 performanceFee; // The percent in Basis points of profit that is charged as a fee.
         address performanceFeeRecipient; // The address to pay the `performanceFee` to.
+        bool reporting; // Bool to prevent reentrancy during report calls
         
 
         // Access management addressess for permisssioned functions.
@@ -176,6 +180,11 @@ library BaseLibrary {
     /*//////////////////////////////////////////////////////////////
                             MODIFIERS
     //////////////////////////////////////////////////////////////*/
+
+    modifier notReporting() {
+        isNotReporting();
+        _;
+    }
 
     modifier onlyManagement() {
         isManagement();
@@ -188,6 +197,10 @@ library BaseLibrary {
     }
 
     // These are left public to allow for the strategy to use them as well
+
+    function isNotReporting() public view {
+        require(!_baseStrategyStorgage().reporting, "!reporting");
+    }
 
     function isManagement() public view {
         if (msg.sender != _baseStrategyStorgage().management)
@@ -309,155 +322,273 @@ library BaseLibrary {
     function deposit(
         uint256 assets,
         address receiver
-    ) public returns (uint256 shares) {
-        require(receiver != address(this), "ERC4626: mint to self");
-        // check lower than max
-        require(
-            assets <= maxDeposit(receiver),
-            "ERC4626: deposit more than max"
-        );
-
+    ) public notReporting returns (uint256 shares) {
         // Check for rounding error since we round down in previewDeposit.
         require((shares = previewDeposit(assets)) != 0, "ZERO_SHARES");
 
-        // Need to transfer before minting or ERC777s could reenter.
-        _baseStrategyStorgage().asset.safeTransferFrom(
-            msg.sender,
-            address(this),
-            assets
-        );
-
-        // mint shares
-        _mint(receiver, shares);
-
-        emit Deposit(msg.sender, receiver, assets, shares);
-
-        // let strategy invest the funds if applicable
-        _depositFunds(assets, false);
+        _deposit(receiver, assets, shares);
     }
 
     function mint(
         uint256 shares,
         address receiver
-    ) public returns (uint256 assets) {
-        require(receiver != address(this), "ERC4626: mint to self");
-        require(shares <= maxMint(receiver), "ERC4626: mint more than max");
+    ) public notReporting returns (uint256 assets) {
+        // No need to check for rounding error, previewMint rounds up.
+        assets = previewMint(shares);
 
-        assets = previewMint(shares); // No need to check for rounding error, previewMint rounds up.
-
-        // Need to transfer before minting or ERC777s could reenter.
-        _baseStrategyStorgage().asset.safeTransferFrom(
-            msg.sender,
-            address(this),
-            assets
-        );
-
-        _mint(receiver, shares);
-
-        emit Deposit(msg.sender, receiver, assets, shares);
-
-        // let strategy invest the funds if applicable
-        _depositFunds(assets, false);
+        _deposit(receiver, assets, shares);
     }
 
     function withdraw(
         uint256 assets,
         address receiver,
         address owner
-    ) public returns (uint256 shares) {
-        require(
-            assets <= maxWithdraw(owner),
-            "ERC4626: withdraw more than max"
-        );
+    ) public notReporting returns (uint256 shares) {
+        // No need to check for rounding error, previewWithdraw rounds up.
+        shares = previewWithdraw(assets);
 
-        shares = previewWithdraw(assets); // No need to check for rounding error, previewWithdraw rounds up.
-
-        if (msg.sender != owner) {
-            _spendAllowance(owner, msg.sender, shares);
-        }
-
-        _withdrawFunds(assets);
-
-        _burn(owner, shares);
-
-        _baseStrategyStorgage().asset.safeTransfer(receiver, assets);
-
-        emit Withdraw(msg.sender, receiver, owner, assets, shares);
+        _withdraw(receiver, owner, assets, shares);
     }
 
     function redeem(
         uint256 shares,
         address receiver,
         address owner
-    ) public returns (uint256 assets) {
-        require(shares <= maxRedeem(owner), "ERC4626: redeem more than max");
+    ) public notReporting returns (uint256 assets) {
+        // Check for rounding error since we round down in previewRedeem.
+        require((assets = previewRedeem(shares)) != 0, "ZERO_ASSETS");
+
+        _withdraw(receiver, owner, assets, shares);
+    }
+
+    function convertToShares(uint256 assets) public view returns (uint256) {
+        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
+
+        return
+            supply == 0
+                ? assets
+                : assets.mulDiv(supply, totalAssets(), Math.Rounding.Down);
+    }
+
+    function convertToAssets(uint256 shares) public view returns (uint256) {
+        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
+
+        return
+            supply == 0
+                ? shares
+                : shares.mulDiv(totalAssets(), supply, Math.Rounding.Down);
+    }
+
+    function previewDeposit(uint256 assets) public view returns (uint256) {
+        return convertToShares(assets);
+    }
+
+    function previewMint(uint256 shares) public view returns (uint256) {
+        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
+
+        return
+            supply == 0
+                ? shares
+                : shares.mulDiv(totalAssets(), supply, Math.Rounding.Up);
+    }
+
+    function previewWithdraw(uint256 assets) public view returns (uint256) {
+        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
+
+        return
+            supply == 0
+                ? assets
+                : assets.mulDiv(supply, totalAssets(), Math.Rounding.Up);
+    }
+
+    function previewRedeem(uint256 shares) public view returns (uint256) {
+        return convertToAssets(shares);
+    }
+
+    function maxDeposit(address _owner) public view returns (uint256) {
+        return IBaseStrategy(address(this)).availableDepositLimit(_owner);
+    }
+
+    function maxMint(address _owner) public view returns (uint256 _maxMint) {
+        _maxMint = IBaseStrategy(address(this)).availableDepositLimit(_owner);
+        if (_maxMint != type(uint256).max) {
+            _maxMint = convertToShares(_maxMint);
+        }
+    }
+
+    function maxWithdraw(
+        address _owner
+    ) public view returns (uint256 _maxWithdraw) {
+        _maxWithdraw = IBaseStrategy(address(this)).availableWithdrawLimit(
+            _owner
+        );
+        if (_maxWithdraw == type(uint256).max) {
+            // Saves a min check if there is no withdrawal limit.
+            _maxWithdraw = convertToAssets(balanceOf(_owner));
+        } else {
+            _maxWithdraw = Math.min(
+                convertToAssets(balanceOf(_owner)),
+                _maxWithdraw
+            );
+        }
+    }
+
+    function maxRedeem(
+        address _owner
+    ) public view returns (uint256 _maxRedeem) {
+        _maxRedeem = IBaseStrategy(address(this)).availableWithdrawLimit(
+            _owner
+        );
+        // Conversion would overflow and saves a min check if there is no withdrawal limit.
+        if (_maxRedeem == type(uint256).max) {
+            _maxRedeem = balanceOf(_owner);
+        } else {
+            _maxRedeem = Math.min(
+                convertToShares(_maxRedeem),
+                balanceOf(_owner)
+            );
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            ACCOUNTING LOGIC
+    //////////////////////////////////////////////////////////////*/
+
+    function totalAssets() public view returns (uint256) {
+        BaseStrategyData storage S = _baseStrategyStorgage();
+        return S.totalIdle + S.totalDebt;
+    }
+
+    function totalSupply() public view returns (uint256) {
+        return _baseStrategyStorgage().totalSupply - _unlockedShares();
+    }
+
+    /**
+     * @dev Function to be called during {deposit} and {mint} after
+     * all neccesary checks have been completed.
+     *
+     * This function handles all logic including transfers, minting and accounting.
+     *
+     * We do all external calls before updating any internal values to prevent
+     * re-entrancy from the token transfers or the _invest() calls.
+     */
+    function _deposit(
+        address receiver,
+        uint256 assets,
+        uint256 shares
+    ) private {
+        require(receiver != address(this), "ERC4626: mint to self");
+        require(
+            assets <= maxDeposit(msg.sender),
+            "ERC4626: deposit more than max"
+        );
+
+        // Cache storage variables used more than once.
+        BaseStrategyData storage S = _baseStrategyStorgage();
+        ERC20 _asset = S.asset;
+
+        // Need to transfer before minting or ERC777s could reenter.
+        _asset.safeTransferFrom(msg.sender, address(this), assets);
+
+        // We will deposit up to current idle plus the new amount added
+        uint256 toInvest = S.totalIdle + assets;
+
+        // Cache for post {invest} checks.
+        uint256 beforeBalance = _asset.balanceOf(address(this));
+
+        // Invest up to all loose funds. Signal its during a permisionless deposit.
+        IBaseStrategy(address(this)).invest(toInvest, false);
+
+        // Always get the actual amount invested for complete accuracy
+        // We double check the diff agianst toInvest to never underflow
+        uint256 invested = Math.min(
+            beforeBalance - _asset.balanceOf(address(this)),
+            toInvest
+        );
+
+        // Adjust total Assets.
+        unchecked {
+            // Can't overflow, or the preview conversions would too.
+            S.totalDebt += invested;
+            // Cant't underflow due to previous min check.
+            S.totalIdle = toInvest - invested;
+        }
+
+        // mint shares
+        _mint(receiver, shares);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+    }
+
+    /**
+     * @dev To be called after all neccesary checks have been done in
+     * {redeem} and {withdraw}.
+     *
+     * This will handle all logic, transfers and accounting in order to
+     * service the withdraw request.
+     *
+     * If we are not able to withdraw the full amount needed, it will
+     * be counted as a loss and passed on to the user.
+     */
+    function _withdraw(
+        address receiver,
+        address owner,
+        uint256 assets,
+        uint256 shares
+    ) private {
+        require(shares <= maxRedeem(owner), "ERC4626: withdraw more than max");
 
         if (msg.sender != owner) {
             _spendAllowance(owner, msg.sender, shares);
         }
 
-        // Check for rounding error since we round down in previewRedeem.
-        require((assets = previewRedeem(shares)) != 0, "ZERO_ASSETS");
-
-        // withdraw if we dont have enough idle
-        _withdrawFunds(assets);
-
-        _burn(owner, shares);
-
-        _baseStrategyStorgage().asset.safeTransfer(receiver, assets);
-
-        emit Withdraw(msg.sender, receiver, owner, assets, shares);
-    }
-
-    // post deposit/report hook to deposit any loose funds
-    function _depositFunds(uint256 _newAmount, bool _reported) private {
         BaseStrategyData storage S = _baseStrategyStorgage();
-        ERC20 _asset = S.asset;
-        // We will deposit up to current idle plus the new amount added
-        uint256 toInvest = S.totalIdle + _newAmount;
-
-        uint256 before = _asset.balanceOf(address(this));
-        // invest if applicable
-        IBaseStrategy(address(this)).invest(toInvest, _reported);
-
-        // Always get the actual amount invested for higher accuracy
-        // We double check the diff agianst toInvest to never underflow
-        uint256 invested = Math.min(
-            before - _asset.balanceOf(address(this)),
-            toInvest
-        );
-
-        // adjust total Assets
-        S.totalDebt += invested;
-        // check if we invested all the loose asset
-        S.totalIdle = toInvest - invested;
-    }
-
-    // TODO: Make this better
-    //      This should return the actual amount freed so it can accept losses
-    function _withdrawFunds(uint256 _amount) private {
-        BaseStrategyData storage S = _baseStrategyStorgage();
+        // Expected beharvior is to need to free funds so we cache `_asset`.
         ERC20 _asset = S.asset;
 
         uint256 idle = S.totalIdle;
 
-        if (idle >= _amount) {
-            // We dont need to withdraw anything
-            S.totalIdle -= _amount;
-        } else {
-            // withdraw if we dont have enough idle
+        if (idle < assets) {
+            // We need to withdraw funds
+
+            // Cache before balance for diff checks.
             uint256 before = _asset.balanceOf(address(this));
-            // free what we need - what we have
-            IBaseStrategy(address(this)).freeFunds(_amount - idle);
+            // Tell implementation to free what we need.
+            unchecked {
+                IBaseStrategy(address(this)).freeFunds(assets - idle);
+            }
+            // Return the actual amount withdrawn. Adjust for potential overwithdraws.
+            // TODO: Add an if check here so were only pulling from storage if neccesary?
+            uint256 withdrawn = Math.min(
+                _asset.balanceOf(address(this)) - before,
+                S.totalDebt
+            );
 
-            // get the exact amount to account for loss or errors
-            uint256 withdrawn = _asset.balanceOf(address(this)) - before;
-            // TODO: should account for errors here to not overflow or over withdraw
-            S.totalDebt -= withdrawn;
+            unchecked {
+                idle += withdrawn;
+            }
 
-            // we are giving the full amount of our idle funds
-            S.totalIdle = 0;
+            uint256 loss;
+            // If we didn't get enough out then we have a loss
+            if (idle < assets) {
+                unchecked {
+                    loss = assets - idle;
+                }
+                assets = idle;
+            }
+
+            // Update debt storage.
+            S.totalDebt -= (withdrawn + loss);
         }
+
+        // Update idle based on how much we took
+        S.totalIdle = idle - assets;
+
+        _burn(owner, shares);
+
+        _asset.safeTransfer(receiver, assets);
+
+        emit Withdraw(msg.sender, receiver, owner, assets, shares);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -487,11 +618,15 @@ library BaseLibrary {
      */
     function report()
         external
+        notReporting
         onlyKeepers
         returns (uint256 profit, uint256 loss)
     {
         // Cache storage pointer since its used again at the end
         BaseStrategyData storage S = _baseStrategyStorgage();
+        // set reporting = True for reentrancy
+        S.reporting = true;
+
         uint256 oldTotalAssets;
         unchecked {
             // Manuaully calculate totalAssets to save an SLOAD
@@ -579,7 +714,8 @@ library BaseLibrary {
                 uint256 previouslyLockedShares = totalLockedShares -
                     sharesToLock;
 
-                // new_profit_locking_period is a weighted average between the remaining time of the previously locked shares and the PROFIT_MAX_UNLOCK_TIME
+                // new_profit_locking_period is a weighted average between the remaining
+                // time of the previously locked shares and the PROFIT_MAX_UNLOCK_TIME
                 uint256 newProfitLockingPeriod = (previouslyLockedShares *
                     remainingTime +
                     sharesToLock *
@@ -593,20 +729,16 @@ library BaseLibrary {
                     block.timestamp +
                     newProfitLockingPeriod;
             } else {
-                // NOTE: only setting this to 0 will turn in the desired effect, no need to update fullProfitUnlockDate
+                // NOTE: only setting this to 0 will turn in the desired effect,
+                // no need to update fullProfitUnlockDate
                 S.profitUnlockingRate = 0;
             }
         }
 
-        // Update storage variables
-        uint256 newIdle = S.asset.balanceOf(address(this));
-        // Set totalIdle to the actual amount we have loose
-        S.totalIdle = newIdle;
-        // the new debt should only be what is not loose
-        S.totalDebt = _invested - newIdle;
+        // Update last report before external calls
         S.lastReport = block.timestamp;
 
-        // emit event with info
+        // Emit event with info
         emit Reported(
             profit,
             loss,
@@ -614,8 +746,22 @@ library BaseLibrary {
             totalFees - performanceFees // Protocol fees
         );
 
+        // We need to update storage here for potential view reentrancy during
+        // the external {invest} call so pps is not distorted.
+        // NOTE: We could save an extra SSTORE here by only updating S.totalDebt = S.totalDebt + profit - loss. But reentrancy withdraws could break?
+        uint256 newIdle = S.asset.balanceOf(address(this));
+        S.totalIdle = newIdle;
+        S.totalDebt = _invested - newIdle;
+
         // invest any idle funds, tell strategy it is during a report call
-        _depositFunds(0, true);
+        IBaseStrategy(address(this)).invest(newIdle, true);
+
+        // Update storage based on actual amounts
+        newIdle = S.asset.balanceOf(address(this));
+        S.totalIdle = newIdle;
+        S.totalDebt = _invested - newIdle;
+        // Reset reporting bool
+        S.reporting = false;
     }
 
     function _assessProtocolFees(
@@ -634,7 +780,7 @@ library BaseLibrary {
         if (protocolFeeBps > 0) {
             protocolFeesRecipient = _protocolFeesRecipient;
             // NOTE: charge fees since last report OR last fee change
-            //      (this will mean less fees are charged after a change in protocol_fees, but fees should not change frequently)
+            // (this will mean less fees are charged after a change in protocol_fees, but fees should not change frequently)
             uint256 secondsSinceLastReport = Math.min(
                 block.timestamp - _baseStrategyStorgage().lastReport,
                 block.timestamp - uint256(protocolFeeLastChange)
@@ -644,6 +790,7 @@ library BaseLibrary {
                 (uint256(protocolFeeBps) *
                     _oldTotalAssets *
                     secondsSinceLastReport) /
+                // TODO: make this one number for less runtime calculations
                 24 /
                 365 /
                 3600 /
@@ -663,6 +810,23 @@ library BaseLibrary {
         }
 
         _burn(address(this), unlcokdedShares);
+    }
+
+    function _unlockedShares() private view returns (uint256) {
+        // should save 2 extra calls for most scenarios
+        BaseStrategyData storage S = _baseStrategyStorgage();
+        uint256 _fullProfitUnlockDate = S.fullProfitUnlockDate;
+        uint256 unlockedShares;
+        if (_fullProfitUnlockDate > block.timestamp) {
+            unlockedShares =
+                (S.profitUnlockingRate * (block.timestamp - S.lastReport)) /
+                MAX_BPS_EXTENDED;
+        } else if (_fullProfitUnlockDate != 0) {
+            // All shares have been unlocked
+            unlockedShares = S.balances[address(this)];
+        }
+
+        return unlockedShares;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -685,7 +849,7 @@ library BaseLibrary {
      *
      * A report() call will be needed to record the profit.
      */
-    function tend() external onlyKeepers {
+    function tend() external notReporting onlyKeepers {
         BaseStrategyData storage S = _baseStrategyStorgage();
         // Expected Behavior is this will get used twice so we cache it
         uint256 _totalIdle = S.totalIdle;
@@ -716,117 +880,14 @@ library BaseLibrary {
     }
 
     /*//////////////////////////////////////////////////////////////
-                            ACCOUNTING LOGIC
-    //////////////////////////////////////////////////////////////*/
-
-    function totalAssets() public view returns (uint256) {
-        BaseStrategyData storage S = _baseStrategyStorgage();
-        return S.totalIdle + S.totalDebt;
-    }
-
-    function totalSupply() public view returns (uint256) {
-        return _baseStrategyStorgage().totalSupply - _unlockedShares();
-    }
-
-    function _unlockedShares() private view returns (uint256) {
-        // should save 2 extra calls for most scenarios
-        BaseStrategyData storage S = _baseStrategyStorgage();
-        uint256 _fullProfitUnlockDate = S.fullProfitUnlockDate;
-        uint256 unlockedShares;
-        if (_fullProfitUnlockDate > block.timestamp) {
-            unlockedShares =
-                (S.profitUnlockingRate * (block.timestamp - S.lastReport)) /
-                MAX_BPS_EXTENDED;
-        } else if (_fullProfitUnlockDate != 0) {
-            // All shares have been unlocked
-            unlockedShares = S.balances[address(this)];
-        }
-
-        return unlockedShares;
-    }
-
-    function convertToShares(uint256 assets) public view returns (uint256) {
-        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
-
-        return
-            supply == 0
-                ? assets
-                : assets.mulDiv(supply, totalAssets(), Math.Rounding.Down);
-    }
-
-    function convertToAssets(uint256 shares) public view returns (uint256) {
-        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
-
-        return
-            supply == 0
-                ? shares
-                : shares.mulDiv(totalAssets(), supply, Math.Rounding.Down);
-    }
-
-    function previewDeposit(uint256 assets) public view returns (uint256) {
-        return convertToShares(assets);
-    }
-
-    function previewMint(uint256 shares) public view returns (uint256) {
-        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
-
-        return
-            supply == 0
-                ? shares
-                : shares.mulDiv(totalAssets(), supply, Math.Rounding.Up);
-    }
-
-    function previewWithdraw(uint256 assets) public view returns (uint256) {
-        uint256 supply = totalSupply(); // Saves an extra SLOAD if totalSupply() is non-zero.
-
-        return
-            supply == 0
-                ? assets
-                : assets.mulDiv(supply, totalAssets(), Math.Rounding.Up);
-    }
-
-    function previewRedeem(uint256 shares) public view returns (uint256) {
-        return convertToAssets(shares);
-    }
-
-    function maxDeposit(address _owner) public view returns (uint256) {
-        return IBaseStrategy(address(this)).availableDepositLimit(_owner);
-    }
-
-    function maxMint(address _owner) public view returns (uint256 _maxMint) {
-        _maxMint = IBaseStrategy(address(this)).availableDepositLimit(_owner);
-        if (_maxMint != type(uint256).max) {
-            _maxMint = convertToShares(_maxMint);
-        }
-    }
-
-    function maxWithdraw(address _owner) public view returns (uint256) {
-        return
-            Math.min(
-                convertToAssets(balanceOf(_owner)),
-                IBaseStrategy(address(this)).availableWithdrawLimit(_owner)
-            );
-    }
-
-    function maxRedeem(
-        address _owner
-    ) public view returns (uint256 _maxRedeem) {
-        _maxRedeem = IBaseStrategy(address(this)).availableWithdrawLimit(
-            _owner
-        );
-        if (_maxRedeem == type(uint256).max) {
-            _maxRedeem = balanceOf(_owner);
-        } else {
-            _maxRedeem = Math.min(_maxRedeem, balanceOf(_owner));
-        }
-    }
-
-    /*//////////////////////////////////////////////////////////////
                         Getter FUNCIONS
     //////////////////////////////////////////////////////////////*/
 
     // External view function to pull public variables from storage
 
+    /**
+     * @notice Get the api version for this Library.
+     */
     function apiVersion() external pure returns (string memory) {
         return API_VERSION;
     }

@@ -256,13 +256,13 @@ abstract contract BaseStrategy is IBaseStrategy {
 
     function availableDepositLimit(
         address /*_owner*/
-    ) external view virtual returns (uint256) {
+    ) public view virtual returns (uint256) {
         return type(uint256).max;
     }
 
     function availableWithdrawLimit(
         address /*_owner*/
-    ) external view virtual returns (uint256) {
+    ) public view virtual returns (uint256) {
         return type(uint256).max;
     }
 

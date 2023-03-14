@@ -8,6 +8,7 @@ import {ERC20Mock} from "@openzeppelin/contracts/mocks/ERC20Mock.sol";
 import {IMockStrategy} from "../Mocks/IMockStrategy.sol";
 import {MockStrategy, MockYieldSource} from "../Mocks/MockStrategy.sol";
 import {MockIlliquidStrategy} from "../Mocks/MockIlliquidStrategy.sol";
+import {MockFaultyStrategy} from "../Mocks/MockFaultyStrategy.sol";
 import {MockFactory} from "../Mocks/MockFactory.sol";
 
 import {DiamondHelper} from "../../DiamondHelper.sol";
@@ -19,20 +20,24 @@ interface ERC {
     function name() external returns (string memory);
 }
 
+// TODO: add check strategy totals() to every function
+
 contract Setup is ExtendedTest {
+    // Contract instancees that we will use repeatedly.
     ERC20Mock public asset;
     IMockStrategy public strategy;
     MockFactory public mockFactory;
     MockYieldSource public yieldSource;
-
     DiamondHelper public diamondHelper;
 
+    // Addresses for different roles we will use repeatedly.
     address public management = address(1);
     address public protocolFeeRecipient = address(2);
     address public performanceFeeRecipient = address(3);
     address public keeper = address(4);
     address public user = address(10);
 
+    // Integer variables that will be used repeatedly.
     // Fuzz from $0.01 of 1e6 stable coins up to 1 trillion of a 1e18 coin
     uint256 public minFuzzAmount = 10_000;
     uint256 public maxFuzzAmount = 1e30;
@@ -41,7 +46,6 @@ contract Setup is ExtendedTest {
     uint256 public decimals = 18;
     uint256 public wad = 10 ** decimals;
     uint256 public profitMaxUnlockTime = 10 days;
-    uint256 public maxPPSPercentDelta = 100;
 
     function setUp() public virtual {
         // deploy the selector helper first to get a deterministic location
@@ -50,8 +54,6 @@ contract Setup is ExtendedTest {
 
         // deploy the mock factory next for deterministic location
         mockFactory = new MockFactory(0, protocolFeeRecipient);
-
-        console.log(address(BaseLibrary));
 
         diamondHelper.setLibrary(address(BaseLibrary));
 
@@ -71,7 +73,7 @@ contract Setup is ExtendedTest {
         vm.label(address(asset), "asset");
         vm.label(address(strategy), "strategy");
         vm.label(address(BaseLibrary), "library");
-        vm.label(address(diamondHelper), "selector helper");
+        vm.label(address(diamondHelper), "Diamond heleper");
         vm.label(address(yieldSource), "Mock Yield Source");
         vm.label(address(mockFactory), "mock Factory");
     }
@@ -81,12 +83,93 @@ contract Setup is ExtendedTest {
         vm.prank(_user);
         asset.approve(address(strategy), _amount);
 
-        uint256 beforeBalance = strategy.totalAssets();
-
         vm.prank(_user);
         strategy.deposit(_amount, _user);
+    }
 
-        assertEq(strategy.totalAssets(), beforeBalance + _amount);
+    function checkStrategyTotals(
+        uint256 _totalAssets,
+        uint256 _totalDebt,
+        uint256 _totalIdle,
+        uint256 _totalSupply
+    ) public {
+        assertEq(strategy.totalAssets(), _totalAssets, "!totalAssets");
+        assertEq(strategy.totalDebt(), _totalDebt, "!totalDebt");
+        assertEq(strategy.totalIdle(), _totalIdle, "!totalIdle");
+        assertEq(_totalAssets, _totalDebt + _totalIdle, "!Added");
+        // We give supply a buffer or 1 wei for rounding
+        assertApproxEq(strategy.totalSupply(), _totalSupply, 1, "!supply");
+    }
+
+    // For checks without totalSupply while profit is unlocking
+    function checkStrategyTotals(
+        uint256 _totalAssets,
+        uint256 _totalDebt,
+        uint256 _totalIdle
+    ) public {
+        assertEq(strategy.totalAssets(), _totalAssets, "!totalAssets");
+        assertEq(strategy.totalDebt(), _totalDebt, "!totalDebt");
+        assertEq(strategy.totalIdle(), _totalIdle, "!totalIdle");
+        assertEq(_totalAssets, _totalDebt + _totalIdle, "!Added");
+    }
+
+    function createAndCheckProfit(
+        uint256 profit,
+        uint256 _protocolFees,
+        uint256 _performanceFees
+    ) public {
+        uint256 startingAssets = strategy.totalAssets();
+        asset.mint(address(strategy), profit);
+
+        // Check the event matches the expected values
+        vm.expectEmit(true, true, true, true, address(strategy));
+        emit BaseLibrary.Reported(profit, 0, _performanceFees, _protocolFees);
+
+        vm.prank(keeper);
+        (uint256 _profit, uint256 _loss) = strategy.report();
+
+        assertEq(profit, _profit, "profit reported wrong");
+        assertEq(_loss, 0, "Reported loss");
+        assertEq(
+            strategy.totalAssets(),
+            startingAssets + profit,
+            "total assets wrong"
+        );
+    }
+
+    function createAndCheckLoss(
+        uint256 loss,
+        uint256 _protocolFees,
+        uint256 _performanceFees
+    ) public {
+        uint256 startingAssets = strategy.totalAssets();
+
+        yieldSource.simulateLoss(loss);
+        // Check the event matches the expected values
+        vm.expectEmit(true, true, false, true, address(strategy));
+        emit BaseLibrary.Reported(0, loss, _performanceFees, _protocolFees);
+
+        vm.prank(keeper);
+        (uint256 _profit, uint256 _loss) = strategy.report();
+
+        assertEq(0, _profit, "profit reported wrong");
+        assertEq(_loss, loss, "Reported loss");
+        assertEq(
+            strategy.totalAssets(),
+            startingAssets - loss,
+            "total assets wrong"
+        );
+    }
+
+    function increaseTimeAndCheckBuffer(uint256 _time, uint256 _buffer) public {
+        skip(_time);
+        // We give a buffer or 1 wei for rounding
+        assertApproxEq(
+            strategy.balanceOf(address(strategy)),
+            _buffer,
+            1,
+            "!Buffer"
+        );
     }
 
     function getSelectors() public pure returns (bytes4[] memory selectors) {
@@ -178,5 +261,41 @@ contract Setup is ExtendedTest {
         _strategy.setManagement(management);
 
         return address(_strategy);
+    }
+
+    function setUpFaultyStrategy() public returns (address) {
+        IMockStrategy _strategy = IMockStrategy(
+            address(
+                new MockFaultyStrategy(address(asset), address(yieldSource))
+            )
+        );
+
+        // set keeper
+        _strategy.setKeeper(keeper);
+        // set treasury
+        _strategy.setPerformanceFeeRecipient(performanceFeeRecipient);
+        // set management of the strategy
+        _strategy.setManagement(management);
+
+        return address(_strategy);
+    }
+
+    function setupWhitelist(address _address) public {
+        MockIlliquidStrategy _strategy = MockIlliquidStrategy(
+            payable(address(strategy))
+        );
+
+        _strategy.setWhitelist(true);
+
+        _strategy.allow(_address);
+    }
+
+    function configureFaultyStrategy(uint256 _fault, bool _callBack) public {
+        MockFaultyStrategy _strategy = MockFaultyStrategy(
+            payable(address(strategy))
+        );
+
+        _strategy.setFaultAmount(_fault);
+        _strategy.setCallBack(_callBack);
     }
 }

@@ -4,6 +4,10 @@ pragma solidity 0.8.14;
 import {IDiamond} from "./interfaces/IDiamond.sol";
 import {IDiamondLoupe} from "./interfaces/IDiamondLoupe.sol";
 
+interface IBaseLibrary {
+    function apiVersion() external view returns (string memory);
+}
+
 contract DiamondHelper {
     bytes4[] private selectors;
     IDiamond.FacetCut[] private cuts;
@@ -12,6 +16,13 @@ contract DiamondHelper {
 
     constructor(bytes4[] memory _selectors) {
         selectors = _selectors;
+    }
+
+    /**
+     * @notice Get the api version for this helper.
+     */
+    function apiVersion() external view returns (string memory) {
+        return IBaseLibrary(baseLibrary).apiVersion();
     }
 
     /**
@@ -57,6 +68,7 @@ contract DiamondHelper {
         view
         returns (IDiamondLoupe.Facet[] memory facets_)
     {
+        facets_ = new IDiamondLoupe.Facet[](1);
         // we forward all calls to the base library
         facets_[0] = IDiamondLoupe.Facet(baseLibrary, selectors);
     }
@@ -83,6 +95,7 @@ contract DiamondHelper {
         view
         returns (address[] memory facetAddresses_)
     {
+        facetAddresses_ = new address[](1);
         // we only use one facet
         facetAddresses_[0] = baseLibrary;
     }

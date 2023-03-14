@@ -9,13 +9,13 @@ contract AccountingTest is Setup {
         super.setUp();
     }
 
-    // TODO: use profit factor for all these and set fees to 0 for calculations
-
     function test_airdropDoesNotIncreasePPS(
         address _address,
-        uint256 _amount
+        uint256 _amount,
+        uint256 _profitFactor
     ) public {
         _amount = bound(_amount, minFuzzAmount, maxFuzzAmount);
+        _profitFactor = bound(_profitFactor, 10, MAX_BPS);
         vm.assume(_address != address(0) && _address != address(strategy));
 
         // set fees to 0 for calculations simplicity
@@ -33,7 +33,7 @@ contract AccountingTest is Setup {
         assertEq(strategy.pricePerShare(), pricePerShare);
 
         // aidrop to strategy
-        uint256 toAirdrop = _amount / 10;
+        uint256 toAirdrop = (_amount * _profitFactor) / MAX_BPS;
         asset.mint(address(strategy), toAirdrop);
 
         // nothing should change
@@ -54,14 +54,15 @@ contract AccountingTest is Setup {
 
     function test_airdropDoesNotIncreasePPS_reportRecordsIt(
         address _address,
-        uint256 _amount
+        uint256 _amount,
+        uint256 _profitFactor
     ) public {
         _amount = bound(_amount, minFuzzAmount, maxFuzzAmount);
+        _profitFactor = bound(_profitFactor, 10, MAX_BPS);
         vm.assume(_address != address(0) && _address != address(strategy));
 
         // set fees to 0 for calculations simplicity
-        vm.prank(management);
-        strategy.setPerformanceFee(0);
+        setFees(0, 0);
 
         // nothing has happened pps should be 1
         uint256 pricePerShare = strategy.pricePerShare();
@@ -74,7 +75,7 @@ contract AccountingTest is Setup {
         assertEq(strategy.pricePerShare(), pricePerShare);
 
         // aidrop to strategy
-        uint256 toAirdrop = _amount / 10;
+        uint256 toAirdrop = (_amount * _profitFactor) / MAX_BPS;
         asset.mint(address(strategy), toAirdrop);
 
         // nothing should change
@@ -105,11 +106,11 @@ contract AccountingTest is Setup {
         // skip the rest of the time for unlocking
         skip(profitMaxUnlockTime / 2);
 
-        // we should get a 10% return - any rounding down erros for airdrop
+        // we should get a % return equal to our profit factor
         assertRelApproxEq(
             strategy.pricePerShare(),
-            wad + (wad / 10),
-            maxPPSPercentDelta
+            wad + ((wad * _profitFactor) / MAX_BPS),
+            MAX_BPS
         );
         assertEq(strategy.totalDebt(), _amount + toAirdrop);
         assertEq(strategy.totalIdle(), 0);
@@ -130,14 +131,15 @@ contract AccountingTest is Setup {
 
     function test_earningYieldDoesNotIncreasePPS(
         address _address,
-        uint256 _amount
+        uint256 _amount,
+        uint256 _profitFactor
     ) public {
         _amount = bound(_amount, minFuzzAmount, maxFuzzAmount);
+        _profitFactor = bound(_profitFactor, 10, MAX_BPS);
         vm.assume(_address != address(0) && _address != address(strategy));
 
         // set fees to 0 for calculations simplicity
-        vm.prank(management);
-        strategy.setPerformanceFee(0);
+        setFees(0, 0);
 
         // nothing has happened pps should be 1
         uint256 pricePerShare = strategy.pricePerShare();
@@ -150,7 +152,7 @@ contract AccountingTest is Setup {
         assertEq(strategy.pricePerShare(), pricePerShare);
 
         // aidrop to strategy
-        uint256 toAirdrop = _amount / 10;
+        uint256 toAirdrop = (_amount * _profitFactor) / MAX_BPS;
         asset.mint(address(yieldSource), toAirdrop);
 
         // nothing should change
@@ -171,9 +173,11 @@ contract AccountingTest is Setup {
 
     function test_earningYieldDoesNotIncreasePPS_reportRecodsIt(
         address _address,
-        uint256 _amount
+        uint256 _amount,
+        uint256 _profitFactor
     ) public {
         _amount = bound(_amount, minFuzzAmount, maxFuzzAmount);
+        _profitFactor = bound(_profitFactor, 10, MAX_BPS);
         vm.assume(_address != address(0) && _address != address(strategy));
 
         // set fees to 0 for calculations simplicity
@@ -191,7 +195,7 @@ contract AccountingTest is Setup {
         assertEq(strategy.pricePerShare(), pricePerShare);
 
         // aidrop to strategy
-        uint256 toAirdrop = _amount / 10;
+        uint256 toAirdrop = (_amount * _profitFactor) / MAX_BPS;
         asset.mint(address(yieldSource), toAirdrop);
         assertEq(asset.balanceOf(address(yieldSource)), _amount + toAirdrop);
         // nothing should change
@@ -222,11 +226,11 @@ contract AccountingTest is Setup {
         // skip the rest of the time for unlocking
         skip(profitMaxUnlockTime / 2);
 
-        // we should get a 10% return - any rounding down erros for airdrop
+        // we should get a % return equal to our profit factor
         assertRelApproxEq(
             strategy.pricePerShare(),
-            wad + (wad / 10),
-            maxPPSPercentDelta
+            wad + ((wad * _profitFactor) / MAX_BPS),
+            MAX_BPS
         );
         assertEq(strategy.totalDebt(), _amount + toAirdrop);
         assertEq(strategy.totalIdle(), 0);
@@ -376,5 +380,37 @@ contract AccountingTest is Setup {
             wad + ((wad * _profitFactor) / MAX_BPS),
             MAX_BPS
         );
+    }
+
+    function test_withdrawWithUnrealizedLoss(
+        address _address,
+        uint256 _amount,
+        uint256 _lossFactor
+    ) public {
+        _amount = bound(_amount, minFuzzAmount, maxFuzzAmount);
+        _lossFactor = bound(_lossFactor, 10, MAX_BPS);
+        vm.assume(_address != address(0) && _address != address(strategy));
+
+        setFees(0, 0);
+        mintAndDepositIntoStrategy(_address, _amount);
+
+        uint256 toLoose = (_amount * _lossFactor) / MAX_BPS;
+        // Simulate a loss.
+        vm.prank(address(yieldSource));
+        asset.transfer(address(69), toLoose);
+
+        uint256 beforeBalance = asset.balanceOf(_address);
+        uint256 expectedOut = _amount - toLoose;
+        // Withdraw the full amount before the loss is reported.
+        vm.prank(_address);
+        strategy.withdraw(_amount, _address, _address);
+
+        uint256 afterBalance = asset.balanceOf(_address);
+
+        assertEq(afterBalance - beforeBalance, expectedOut);
+        assertEq(strategy.totalDebt(), 0);
+        assertEq(strategy.totalIdle(), 0);
+        assertEq(strategy.totalSupply(), 0);
+        assertEq(strategy.pricePerShare(), wad);
     }
 }

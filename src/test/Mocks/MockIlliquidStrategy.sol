@@ -8,6 +8,8 @@ import {BaseStrategy} from "../../BaseStrategy.sol";
 
 contract MockIlliquidStrategy is BaseStrategy {
     address public yieldSource;
+    bool public whitelist;
+    mapping(address => bool) public allowed;
 
     constructor(
         address _asset,
@@ -38,9 +40,27 @@ contract MockIlliquidStrategy is BaseStrategy {
         }
     }
 
+    function availableDepositLimit(
+        address _owner
+    ) public view override returns (uint256) {
+        if (whitelist && !allowed[_owner]) {
+            return 0;
+        } else {
+            return super.availableDepositLimit(_owner);
+        }
+    }
+
     function availableWithdrawLimit(
         address _owner
     ) public view override returns (uint256) {
         return BaseLibrary.totalIdle();
+    }
+
+    function setWhitelist(bool _bool) external {
+        whitelist = _bool;
+    }
+
+    function allow(address _address) external {
+        allowed[_address] = true;
     }
 }
